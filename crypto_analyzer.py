@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-BTC/ETH Trading Signal Analyzer
-Fetches live OHLCV data from Binance and generates LONG/SHORT signals with TP and SL.
+BTC/ETH Trading Signal Analyzer — Bitunix Futures
+Fetches live OHLCV data from Bitunix perpetual futures and generates
+LONG/SHORT signals with ATR-based TP and SL.
 
 Usage:
   python crypto_analyzer.py                        # analyze BTC and ETH on 1h candles
   python crypto_analyzer.py --coins BTC --interval 4h
   python crypto_analyzer.py --monitor --refresh 300
   python crypto_analyzer.py --demo                 # offline demo with synthetic data
+
+API credentials (optional — only needed for authenticated endpoints):
+  export BITUNIX_API_KEY=your_key
+  export BITUNIX_API_SECRET=your_secret
 """
 
 import argparse
+import hashlib
+import hmac
+import os
 import time
 import sys
 from datetime import datetime
@@ -22,33 +30,97 @@ from colorama import Fore, Style, init
 
 init(autoreset=True)
 
-BINANCE_BASE = "https://api.binance.com/api/v3"
+# Load .env file if present (no external dependency needed)
+_env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+# ── Bitunix Futures API ───────────────────────────────────────────────────────
+
+BITUNIX_BASE = "https://fapi.bitunix.com"
+
+# Bitunix perpetual futures symbols
 SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
 
-# ── Data Fetching ────────────────────────────────────────────────────────────
+# Bitunix interval strings
+INTERVAL_MAP = {
+    "1m":  "1",
+    "5m":  "5",
+    "15m": "15",
+    "30m": "30",
+    "1h":  "60",
+    "4h":  "240",
+    "1d":  "D",
+}
+
+
+def _sign(api_secret: str, params: dict) -> str:
+    """HMAC-SHA256 signature for authenticated Bitunix requests."""
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    return hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+
+
+def _auth_headers(api_key: str, api_secret: str, params: dict) -> dict:
+    ts = str(int(time.time() * 1000))
+    params["timestamp"] = ts
+    params["api_key"] = api_key
+    sig = _sign(api_secret, params)
+    return {
+        "api-key": api_key,
+        "sign": sig,
+        "timestamp": ts,
+        "Content-Type": "application/json",
+    }
+
 
 def fetch_ohlcv(symbol: str, interval: str = "1h", limit: int = 200) -> pd.DataFrame:
-    url = f"{BINANCE_BASE}/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    """Fetch OHLCV klines from Bitunix futures (public endpoint, no auth needed)."""
+    bitunix_interval = INTERVAL_MAP.get(interval, "60")
+    url = f"{BITUNIX_BASE}/api/v1/futures/market/kline"
+    params = {
+        "symbol": symbol,
+        "interval": bitunix_interval,
+        "limit": limit,
+    }
     resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
-    data = resp.json()
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ])
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    body = resp.json()
+
+    # Bitunix response: {"code": 0, "data": [...], "msg": ""}
+    if body.get("code") != 0:
+        raise ValueError(f"Bitunix API error: {body.get('msg', body)}")
+
+    candles = body["data"]
+    rows = []
+    for c in candles:
+        # Bitunix candle fields: time, open, high, low, close, volume (string values)
+        rows.append({
+            "open_time": pd.to_datetime(int(c["time"]), unit="ms"),
+            "open":   float(c["open"]),
+            "high":   float(c["high"]),
+            "low":    float(c["low"]),
+            "close":  float(c["close"]),
+            "volume": float(c["volume"]),
+        })
+
+    df = pd.DataFrame(rows).sort_values("open_time").reset_index(drop=True)
     return df
 
 
-def fetch_price(symbol: str) -> float:
-    url = f"{BINANCE_BASE}/ticker/price"
+def fetch_ticker(symbol: str) -> dict:
+    """Fetch latest ticker from Bitunix futures (public)."""
+    url = f"{BITUNIX_BASE}/api/v1/futures/market/ticker"
     resp = requests.get(url, params={"symbol": symbol}, timeout=5)
     resp.raise_for_status()
-    return float(resp.json()["price"])
+    body = resp.json()
+    if body.get("code") != 0:
+        raise ValueError(f"Bitunix ticker error: {body.get('msg', body)}")
+    return body["data"]
 
 
 def generate_demo_ohlcv(seed_price: float, limit: int = 200) -> pd.DataFrame:
@@ -65,12 +137,13 @@ def generate_demo_ohlcv(seed_price: float, limit: int = 200) -> pd.DataFrame:
         open_ = prices[i - 1] if i > 0 else close
         vol = np.random.uniform(100, 5000)
         ts = pd.Timestamp("2025-01-01") + pd.Timedelta(hours=i)
-        rows.append({"open_time": ts, "open": open_, "high": high, "low": low, "close": close, "volume": vol})
+        rows.append({"open_time": ts, "open": open_, "high": high,
+                     "low": low, "close": close, "volume": vol})
 
     return pd.DataFrame(rows)
 
 
-# ── Technical Indicators ─────────────────────────────────────────────────────
+# ── Technical Indicators ──────────────────────────────────────────────────────
 
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
@@ -137,37 +210,35 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     bb_mid_val = bb_mid.iloc[-1]
     bb_width_pct = (bb_upper_val - bb_lower_val) / bb_mid_val * 100
 
-    ema20 = ema(close, 20).iloc[-1]
-    ema50 = ema(close, 50).iloc[-1]
+    ema20  = ema(close, 20).iloc[-1]
+    ema50  = ema(close, 50).iloc[-1]
     ema200 = ema(close, 200).iloc[-1]
 
     atr_val = atr(df).iloc[-1]
     price = close.iloc[-1]
 
-    # Volume trend (last 5 vs prior 15 candles)
     vol_short = df["volume"].iloc[-5:].mean()
-    vol_long = df["volume"].iloc[-20:-5].mean()
+    vol_long  = df["volume"].iloc[-20:-5].mean()
     vol_ratio = vol_short / vol_long if vol_long > 0 else 1.0
 
-    # Price momentum (rate of change)
     roc_10 = (price - close.iloc[-10]) / close.iloc[-10] * 100
 
     return {
-        "price": price,
-        "rsi": rsi_val,
-        "stoch_rsi": stoch_rsi_val,
-        "macd_hist": macd_hist,
-        "macd_prev_hist": macd_prev_hist,
-        "bb_upper": bb_upper_val,
-        "bb_mid": bb_mid_val,
-        "bb_lower": bb_lower_val,
-        "bb_width_pct": bb_width_pct,
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema200": ema200,
-        "atr": atr_val,
-        "vol_ratio": vol_ratio,
-        "roc_10": roc_10,
+        "price":         price,
+        "rsi":           rsi_val,
+        "stoch_rsi":     stoch_rsi_val,
+        "macd_hist":     macd_hist,
+        "macd_prev_hist":macd_prev_hist,
+        "bb_upper":      bb_upper_val,
+        "bb_mid":        bb_mid_val,
+        "bb_lower":      bb_lower_val,
+        "bb_width_pct":  bb_width_pct,
+        "ema20":         ema20,
+        "ema50":         ema50,
+        "ema200":        ema200,
+        "atr":           atr_val,
+        "vol_ratio":     vol_ratio,
+        "roc_10":        roc_10,
     }
 
 
@@ -284,15 +355,15 @@ def generate_signal(ind: dict) -> dict:
     tp_mult = 3.0
 
     if direction == "LONG":
-        entry = price
-        sl = round(entry - sl_mult * atr_val, 2)
-        tp = round(entry + tp_mult * atr_val, 2)
+        entry  = price
+        sl     = round(entry - sl_mult * atr_val, 2)
+        tp     = round(entry + tp_mult * atr_val, 2)
         sl_pct = round((entry - sl) / entry * 100, 2)
         tp_pct = round((tp - entry) / entry * 100, 2)
     elif direction == "SHORT":
-        entry = price
-        sl = round(entry + sl_mult * atr_val, 2)
-        tp = round(entry - tp_mult * atr_val, 2)
+        entry  = price
+        sl     = round(entry + sl_mult * atr_val, 2)
+        tp     = round(entry - tp_mult * atr_val, 2)
         sl_pct = round((sl - entry) / entry * 100, 2)
         tp_pct = round((entry - tp) / entry * 100, 2)
     else:
@@ -300,45 +371,37 @@ def generate_signal(ind: dict) -> dict:
 
     return {
         "direction": direction,
-        "score": score,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "tp_pct": tp_pct,
-        "sl_pct": sl_pct,
-        "reasons": reasons,
+        "score":     score,
+        "entry":     entry,
+        "tp":        tp,
+        "sl":        sl,
+        "tp_pct":    tp_pct,
+        "sl_pct":    sl_pct,
+        "reasons":   reasons,
     }
 
 
 # ── Display ───────────────────────────────────────────────────────────────────
 
 def direction_color(direction: str) -> str:
-    return {
-        "LONG": Fore.GREEN,
-        "SHORT": Fore.RED,
-        "NEUTRAL": Fore.YELLOW,
-    }.get(direction, Fore.WHITE)
+    return {"LONG": Fore.GREEN, "SHORT": Fore.RED, "NEUTRAL": Fore.YELLOW}.get(direction, Fore.WHITE)
 
 
 def strength_bar(score: int) -> str:
-    MAX = 10
-    filled = min(abs(score), MAX)
-    bar = "█" * filled + "░" * (MAX - filled)
+    filled = min(abs(score), 10)
+    bar = "█" * filled + "░" * (10 - filled)
     color = Fore.GREEN if score > 0 else Fore.RED if score < 0 else Fore.YELLOW
     return f"{color}[{bar}]{Style.RESET_ALL} {score:+d}"
 
 
 def print_analysis(coin: str, ind: dict, sig: dict, interval: str):
     d = direction_color(sig["direction"])
-    price_fmt = f"${ind['price']:,.2f}"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print(f"\n╔{'═' * 58}╗")
-    print(f"║  {Fore.CYAN}{Style.BRIGHT}{coin}/USDT{Style.RESET_ALL}  │  {price_fmt}  │  {interval}  │  {now}  ║")
+    print(f"║  {Fore.CYAN}{Style.BRIGHT}{coin}/USDT PERP{Style.RESET_ALL}  │  ${ind['price']:,.2f}  │  {interval}  │  {now}  ║")
     print(f"╠{'═' * 58}╣")
-
-    signal_line = f"  Signal:  {d}{Style.BRIGHT}{sig['direction']:7s}{Style.RESET_ALL}  {strength_bar(sig['score'])}"
-    print(f"║{signal_line}")
+    print(f"║  Signal:  {d}{Style.BRIGHT}{sig['direction']:7s}{Style.RESET_ALL}  {strength_bar(sig['score'])}")
     print(f"╠{'─' * 58}╣")
 
     if sig["direction"] != "NEUTRAL":
@@ -352,16 +415,16 @@ def print_analysis(coin: str, ind: dict, sig: dict, interval: str):
 
     print(f"╠{'─' * 58}╣")
     print(f"║  {Style.BRIGHT}Indicators:{Style.RESET_ALL}")
-    print(f"║    RSI(14)      : {ind['rsi']:.1f}")
-    print(f"║    Stoch RSI    : {ind['stoch_rsi']:.1f}")
-    print(f"║    MACD hist    : {ind['macd_hist']:.5f}")
+    print(f"║    RSI(14)       : {ind['rsi']:.1f}")
+    print(f"║    Stoch RSI     : {ind['stoch_rsi']:.1f}")
+    print(f"║    MACD hist     : {ind['macd_hist']:.5f}")
     print(f"║    BB upper/lower: ${ind['bb_upper']:,.2f} / ${ind['bb_lower']:,.2f}  (width {ind['bb_width_pct']:.1f}%)")
-    print(f"║    EMA 20       : ${ind['ema20']:,.2f}")
-    print(f"║    EMA 50       : ${ind['ema50']:,.2f}")
-    print(f"║    EMA 200      : ${ind['ema200']:,.2f}")
-    print(f"║    ATR(14)      : ${ind['atr']:,.2f}")
-    print(f"║    Volume ratio : {ind['vol_ratio']:.2f}x  (vs 15-candle avg)")
-    print(f"║    ROC(10)      : {ind['roc_10']:+.2f}%")
+    print(f"║    EMA 20        : ${ind['ema20']:,.2f}")
+    print(f"║    EMA 50        : ${ind['ema50']:,.2f}")
+    print(f"║    EMA 200       : ${ind['ema200']:,.2f}")
+    print(f"║    ATR(14)       : ${ind['atr']:,.2f}")
+    print(f"║    Volume ratio  : {ind['vol_ratio']:.2f}x  (vs 15-candle avg)")
+    print(f"║    ROC(10)       : {ind['roc_10']:+.2f}%")
 
     print(f"╠{'─' * 58}╣")
     print(f"║  {Style.BRIGHT}Signal reasons:{Style.RESET_ALL}")
@@ -373,7 +436,7 @@ def print_analysis(coin: str, ind: dict, sig: dict, interval: str):
 def print_alert(coin: str, sig: dict, prev_direction: str):
     d = direction_color(sig["direction"])
     print(f"\n{'▶' * 3} {Fore.YELLOW}{Style.BRIGHT}SIGNAL CHANGE ALERT{Style.RESET_ALL} {'◀' * 3}")
-    print(f"  {Fore.CYAN}{coin}/USDT{Style.RESET_ALL}  {prev_direction} → {d}{Style.BRIGHT}{sig['direction']}{Style.RESET_ALL}")
+    print(f"  {Fore.CYAN}{coin}/USDT PERP{Style.RESET_ALL}  {prev_direction} → {d}{Style.BRIGHT}{sig['direction']}{Style.RESET_ALL}")
     print(f"  Entry: ${sig['entry']:,.2f}")
     if sig["tp"]:
         print(f"  {Fore.GREEN}TP: ${sig['tp']:,.2f}  (+{sig['tp_pct']:.2f}%){Style.RESET_ALL}")
@@ -407,7 +470,9 @@ def analyze(coins: list, interval: str, verbose: bool, demo: bool = False) -> di
         except requests.HTTPError as e:
             print(f"{Fore.RED}HTTP error fetching {coin}: {e}{Style.RESET_ALL}")
         except requests.ConnectionError:
-            print(f"{Fore.RED}Network error: cannot reach Binance. Check your connection or try --demo.{Style.RESET_ALL}")
+            print(f"{Fore.RED}Network error: cannot reach Bitunix. Check connection or use --demo.{Style.RESET_ALL}")
+        except ValueError as e:
+            print(f"{Fore.RED}{e}{Style.RESET_ALL}")
         except Exception as e:
             print(f"{Fore.RED}Error analyzing {coin}: {e}{Style.RESET_ALL}")
 
@@ -415,8 +480,8 @@ def analyze(coins: list, interval: str, verbose: bool, demo: bool = False) -> di
 
 
 def monitor_loop(coins: list, interval: str, refresh: int, demo: bool):
-    print(f"{Fore.CYAN}Monitoring {', '.join(coins)} every {refresh}s on {interval} candles.{Style.RESET_ALL}")
-    print(f"Press Ctrl+C to stop.\n")
+    print(f"{Fore.CYAN}Monitoring {', '.join(coins)} every {refresh}s on {interval} candles (Bitunix Futures).{Style.RESET_ALL}")
+    print("Press Ctrl+C to stop.\n")
     prev_signals: dict[str, str] = {}
 
     while True:
@@ -438,15 +503,22 @@ def monitor_loop(coins: list, interval: str, refresh: int, demo: bool):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
+    api_key    = os.getenv("BITUNIX_API_KEY", "")
+    api_secret = os.getenv("BITUNIX_API_SECRET", "")
+
     parser = argparse.ArgumentParser(
-        description="BTC/ETH trading signal analyzer — LONG/SHORT with TP and SL",
+        description="BTC/ETH Bitunix Futures signal analyzer — LONG/SHORT with TP and SL",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python crypto_analyzer.py                         # BTC + ETH, 1h, one-shot
+  python crypto_analyzer.py                          # BTC + ETH, 1h, one-shot
   python crypto_analyzer.py --coins BTC --interval 4h
-  python crypto_analyzer.py --monitor --refresh 300 # alert on signal changes
-  python crypto_analyzer.py --demo                  # offline synthetic data
+  python crypto_analyzer.py --monitor --refresh 300  # alert on signal changes
+  python crypto_analyzer.py --demo                   # offline synthetic data
+
+API credentials (for future order-placement features):
+  export BITUNIX_API_KEY=your_key
+  export BITUNIX_API_SECRET=your_secret
         """
     )
     parser.add_argument(
@@ -455,7 +527,7 @@ Examples:
     )
     parser.add_argument(
         "--interval", default="1h",
-        choices=["5m", "15m", "30m", "1h", "4h", "1d"],
+        choices=list(INTERVAL_MAP.keys()),
         help="Candle interval (default: 1h)"
     )
     parser.add_argument(
@@ -471,6 +543,9 @@ Examples:
         help="Use synthetic offline data (no internet required)"
     )
     args = parser.parse_args()
+
+    if api_key:
+        print(f"{Fore.GREEN}API key loaded.{Style.RESET_ALL}")
 
     if args.monitor:
         monitor_loop(args.coins, args.interval, args.refresh, args.demo)
