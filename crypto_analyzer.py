@@ -57,21 +57,82 @@ INTERVAL_MAP = {
 MTF_TIMEFRAMES = ["1h", "4h", "1d"]
 
 
-def _sign(secret: str, params: dict) -> str:
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+def _sign(api_key: str, secret: str, nonce: str, body: str = "") -> str:
+    """
+    Bitunix signature format:
+      digest = HMAC-SHA256(secret, api_key + nonce + body)
+    where body is the raw JSON string for POST, or "" for GET.
+    """
+    msg = api_key + nonce + body
+    return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 
-def _auth_headers(api_key: str, api_secret: str, params: dict) -> dict:
-    ts = str(int(time.time() * 1000))
-    params["timestamp"] = ts
-    params["api_key"] = api_key
-    return {
-        "api-key": api_key,
-        "sign": _sign(api_secret, params),
-        "timestamp": ts,
+def _signed_get(path: str, params: dict | None = None) -> dict:
+    """Authenticated GET request to Bitunix Futures API."""
+    api_key    = os.getenv("BITUNIX_API_KEY", "")
+    api_secret = os.getenv("BITUNIX_API_SECRET", "")
+    if not api_key or not api_secret:
+        raise PermissionError("BITUNIX_API_KEY and BITUNIX_API_SECRET must be set in .env")
+
+    nonce = str(int(time.time() * 1000))
+    # For GET, body is empty; params go in query string
+    query = ""
+    if params:
+        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+    sig = _sign(api_key, api_secret, nonce, body=query)
+    headers = {
+        "api-key":   api_key,
+        "sign":      sig,
+        "nonce":     nonce,
+        "timestamp": nonce,
         "Content-Type": "application/json",
     }
+    url  = f"{BITUNIX_BASE}{path}"
+    resp = requests.get(url, params=params, headers=headers, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ── Account Data ──────────────────────────────────────────────────────────────
+
+def fetch_account() -> dict:
+    """
+    Fetch futures account summary: balance, equity, unrealised PnL, margin.
+    Endpoint: GET /api/v1/futures/account
+    """
+    body = _signed_get("/api/v1/futures/account")
+    if body.get("code") != 0:
+        raise ValueError(f"Account error: {body.get('msg', body)}")
+    return body["data"]
+
+
+def fetch_positions(symbol: str | None = None) -> list[dict]:
+    """
+    Fetch open perpetual positions.
+    Endpoint: GET /api/v1/futures/position/get_pending_positions
+    """
+    params = {}
+    if symbol:
+        params["symbol"] = symbol
+    body = _signed_get("/api/v1/futures/position/get_pending_positions", params or None)
+    if body.get("code") != 0:
+        raise ValueError(f"Positions error: {body.get('msg', body)}")
+    return body.get("data", {}).get("positionList", [])
+
+
+def fetch_open_orders(symbol: str | None = None) -> list[dict]:
+    """
+    Fetch open (unfilled) orders.
+    Endpoint: GET /api/v1/futures/trade/get_pending_orders
+    """
+    params = {"page": 1, "size": 50}
+    if symbol:
+        params["symbol"] = symbol
+    body = _signed_get("/api/v1/futures/trade/get_pending_orders", params)
+    if body.get("code") != 0:
+        raise ValueError(f"Orders error: {body.get('msg', body)}")
+    return body.get("data", {}).get("orderList", [])
 
 
 def fetch_ohlcv(symbol: str, interval: str = "1h", limit: int = 200) -> pd.DataFrame:
@@ -461,6 +522,65 @@ def print_analysis(
     print(f"╚{'═' * 62}╝\n")
 
 
+def print_account(account: dict, positions: list[dict], orders: list[dict]):
+    """Display live account snapshot from Bitunix."""
+    # Account fields vary slightly by API version — handle both naming styles
+    balance    = float(account.get("marginBalance") or account.get("balance")       or 0)
+    available  = float(account.get("available")     or account.get("availableBalance") or 0)
+    used_margin= float(account.get("margin")        or account.get("usedMargin")    or 0)
+    unrealised = float(account.get("unrealisedPnl") or account.get("unrealizedPnl") or 0)
+    equity     = float(account.get("equity")        or balance + unrealised)
+
+    pnl_color = Fore.GREEN if unrealised >= 0 else Fore.RED
+
+    print(f"\n╔{'═' * 62}╗")
+    print(f"║  {Fore.CYAN}{Style.BRIGHT}BITUNIX FUTURES ACCOUNT{Style.RESET_ALL}  │  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"╠{'═' * 62}╣")
+    print(f"║  Equity          : {Style.BRIGHT}${equity:>12,.2f}{Style.RESET_ALL}")
+    print(f"║  Wallet balance  : ${balance:>12,.2f}")
+    print(f"║  Available margin: ${available:>12,.2f}")
+    print(f"║  Used margin     : ${used_margin:>12,.2f}")
+    print(f"║  Unrealised PnL  : {pnl_color}${unrealised:>+12,.2f}{Style.RESET_ALL}")
+
+    if positions:
+        print(f"╠{'─' * 62}╣")
+        print(f"║  {Style.BRIGHT}Open Positions ({len(positions)}):{Style.RESET_ALL}")
+        for p in positions:
+            sym   = p.get("symbol", "?")
+            side  = p.get("side", "?").upper()          # LONG / SHORT
+            size  = float(p.get("size")  or p.get("qty") or 0)
+            ep    = float(p.get("entryPrice") or p.get("avgOpenPrice") or 0)
+            liq   = float(p.get("liqPrice")   or p.get("liquidationPrice") or 0)
+            upnl  = float(p.get("unrealisedPnl") or p.get("unrealizedPnl") or 0)
+            lev   = p.get("leverage", "?")
+            sc    = Fore.GREEN if side == "LONG" else Fore.RED
+            pc    = Fore.GREEN if upnl >= 0 else Fore.RED
+            print(f"║    {sc}{side:5s}{Style.RESET_ALL} {sym:10s}  "
+                  f"size={size}  entry=${ep:,.2f}  liq=${liq:,.2f}  "
+                  f"PnL={pc}${upnl:+,.2f}{Style.RESET_ALL}  {lev}x")
+    else:
+        print(f"╠{'─' * 62}╣")
+        print(f"║  No open positions.")
+
+    if orders:
+        print(f"╠{'─' * 62}╣")
+        print(f"║  {Style.BRIGHT}Open Orders ({len(orders)}):{Style.RESET_ALL}")
+        for o in orders:
+            sym   = o.get("symbol", "?")
+            side  = o.get("side", "?").upper()
+            otype = o.get("orderType", o.get("type", "?"))
+            price = float(o.get("price") or 0)
+            qty   = float(o.get("qty")   or o.get("size") or 0)
+            sc    = Fore.GREEN if side == "BUY" else Fore.RED
+            print(f"║    {sc}{side:4s}{Style.RESET_ALL} {sym:10s}  {otype:8s}  "
+                  f"qty={qty}  price=${price:,.2f}")
+    else:
+        print(f"╠{'─' * 62}╣")
+        print(f"║  No open orders.")
+
+    print(f"╚{'═' * 62}╝\n")
+
+
 def print_alert(coin: str, sig: dict, prev: str, bias: str):
     d  = direction_color(sig["direction"])
     bc = bias_color(bias)
@@ -479,6 +599,20 @@ def print_alert(coin: str, sig: dict, prev: str, bias: str):
 DEMO_SEEDS = {"BTC": 107000, "ETH": 2520}
 
 
+def load_account_balance() -> float | None:
+    """
+    Try to pull available balance from Bitunix account.
+    Returns None silently if no API key or request fails.
+    """
+    if not os.getenv("BITUNIX_API_KEY"):
+        return None
+    try:
+        account = fetch_account()
+        return float(account.get("available") or account.get("availableBalance") or 0) or None
+    except Exception:
+        return None
+
+
 def analyze(
     coins: list,
     interval: str,
@@ -489,12 +623,17 @@ def analyze(
     demo: bool,
     use_mtf: bool = True,
 ) -> dict:
+    # Auto-fetch live balance from account if no manual --balance provided
+    if balance is None and not demo:
+        balance = load_account_balance()
+        if balance and verbose:
+            print(f"{Fore.CYAN}Live account balance: ${balance:,.2f} USDT{Style.RESET_ALL}")
+
     results = {}
 
     for coin in coins:
         symbol = SYMBOLS[coin]
         try:
-            # Primary timeframe data
             if demo:
                 df = generate_demo_ohlcv(DEMO_SEEDS[coin])
                 if verbose:
@@ -504,7 +643,6 @@ def analyze(
 
             ind = compute_indicators(df)
 
-            # Multi-timeframe bias (skip if primary is already the highest TF)
             if use_mtf and interval not in ("4h", "1d"):
                 bias, tf_scores = mtf_bias(coin, demo, DEMO_SEEDS)
             else:
@@ -512,7 +650,6 @@ def analyze(
 
             sig = generate_signal(ind, mtf_bias=bias)
 
-            # Position sizing
             pos = None
             if balance and sig["sl"] is not None:
                 pos = calc_position_size(balance, risk_pct, sig["entry"], sig["sl"], leverage)
@@ -568,22 +705,25 @@ def monitor_loop(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="BTC/ETH Bitunix Futures — LONG/SHORT signals with MTF + position sizing",
+        description="BTC/ETH Bitunix Futures — signals, MTF, position sizing, live account",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python crypto_analyzer.py                               # BTC+ETH, MTF, no sizing
-  python crypto_analyzer.py --balance 10000 --risk 1     # 1% risk on $10k account
-  python crypto_analyzer.py --balance 5000 --risk 2 --leverage 5
-  python crypto_analyzer.py --coins BTC --interval 4h    # single TF, no MTF
-  python crypto_analyzer.py --monitor --refresh 300      # continuous mode
-  python crypto_analyzer.py --demo                       # offline test
+  python crypto_analyzer.py                         # signals + auto balance from account
+  python crypto_analyzer.py --account               # show account snapshot only
+  python crypto_analyzer.py --risk 1 --leverage 10  # 1% risk, 10x leverage
+  python crypto_analyzer.py --balance 10000 --risk 2 --leverage 5
+  python crypto_analyzer.py --coins BTC --interval 4h
+  python crypto_analyzer.py --monitor --refresh 300
+  python crypto_analyzer.py --demo                  # offline test
         """
     )
     parser.add_argument("--coins",    nargs="+", choices=["BTC", "ETH"], default=["BTC", "ETH"])
     parser.add_argument("--interval", default="1h", choices=list(INTERVAL_MAP.keys()))
+    parser.add_argument("--account",  action="store_true",
+                        help="Show live account snapshot (balance, positions, orders) and exit")
     parser.add_argument("--balance",  type=float, default=None,
-                        help="Account balance in USDT for position sizing")
+                        help="Override account balance in USDT (default: pulled from API)")
     parser.add_argument("--risk",     type=float, default=1.0,
                         help="Risk per trade as %% of balance (default: 1.0)")
     parser.add_argument("--leverage", type=int,   default=1,
@@ -596,6 +736,21 @@ Examples:
     api_key = os.getenv("BITUNIX_API_KEY", "")
     if api_key:
         print(f"{Fore.GREEN}Bitunix API key loaded.{Style.RESET_ALL}")
+    elif not args.demo:
+        print(f"{Fore.YELLOW}No API key found — market data only (no account info).{Style.RESET_ALL}")
+
+    # Account snapshot mode
+    if args.account:
+        try:
+            account   = fetch_account()
+            positions = fetch_positions()
+            orders    = fetch_open_orders()
+            print_account(account, positions, orders)
+        except PermissionError as e:
+            print(f"{Fore.RED}{e}{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}Failed to fetch account: {e}{Style.RESET_ALL}")
+        return
 
     if args.monitor:
         monitor_loop(args.coins, args.interval, args.refresh,
