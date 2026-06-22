@@ -2,17 +2,19 @@
 """
 BTC/ETH Trading Signal Analyzer — Bitunix Futures
 Fetches live OHLCV data from Bitunix perpetual futures and generates
-LONG/SHORT signals with ATR-based TP and SL.
+LONG/SHORT signals with ATR-based TP/SL, multi-timeframe confirmation,
+and position size calculation.
 
 Usage:
-  python crypto_analyzer.py                        # analyze BTC and ETH on 1h candles
-  python crypto_analyzer.py --coins BTC --interval 4h
-  python crypto_analyzer.py --monitor --refresh 300
-  python crypto_analyzer.py --demo                 # offline demo with synthetic data
+  python crypto_analyzer.py                             # BTC + ETH, MTF analysis
+  python crypto_analyzer.py --coins BTC --interval 1h  # single timeframe
+  python crypto_analyzer.py --balance 10000 --risk 1   # position sizing
+  python crypto_analyzer.py --monitor --refresh 300    # continuous alerts
+  python crypto_analyzer.py --demo                     # offline synthetic data
 
-API credentials (optional — only needed for authenticated endpoints):
-  export BITUNIX_API_KEY=your_key
-  export BITUNIX_API_SECRET=your_secret
+API credentials — place in .env file or export:
+  BITUNIX_API_KEY=your_key
+  BITUNIX_API_SECRET=your_secret
 """
 
 import argparse
@@ -30,7 +32,8 @@ from colorama import Fore, Style, init
 
 init(autoreset=True)
 
-# Load .env file if present (no external dependency needed)
+# ── Load .env ─────────────────────────────────────────────────────────────────
+
 _env_path = os.path.join(os.path.dirname(__file__), ".env")
 if os.path.exists(_env_path):
     with open(_env_path) as _f:
@@ -43,103 +46,71 @@ if os.path.exists(_env_path):
 # ── Bitunix Futures API ───────────────────────────────────────────────────────
 
 BITUNIX_BASE = "https://fapi.bitunix.com"
+SYMBOLS      = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
 
-# Bitunix perpetual futures symbols
-SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
-
-# Bitunix interval strings
 INTERVAL_MAP = {
-    "1m":  "1",
-    "5m":  "5",
-    "15m": "15",
-    "30m": "30",
-    "1h":  "60",
-    "4h":  "240",
-    "1d":  "D",
+    "1m": "1", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "4h": "240", "1d": "D",
 }
 
+# Timeframes used for multi-timeframe analysis, ordered low→high
+MTF_TIMEFRAMES = ["1h", "4h", "1d"]
 
-def _sign(api_secret: str, params: dict) -> str:
-    """HMAC-SHA256 signature for authenticated Bitunix requests."""
+
+def _sign(secret: str, params: dict) -> str:
     query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    return hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 
 def _auth_headers(api_key: str, api_secret: str, params: dict) -> dict:
     ts = str(int(time.time() * 1000))
     params["timestamp"] = ts
     params["api_key"] = api_key
-    sig = _sign(api_secret, params)
     return {
         "api-key": api_key,
-        "sign": sig,
+        "sign": _sign(api_secret, params),
         "timestamp": ts,
         "Content-Type": "application/json",
     }
 
 
 def fetch_ohlcv(symbol: str, interval: str = "1h", limit: int = 200) -> pd.DataFrame:
-    """Fetch OHLCV klines from Bitunix futures (public endpoint, no auth needed)."""
-    bitunix_interval = INTERVAL_MAP.get(interval, "60")
     url = f"{BITUNIX_BASE}/api/v1/futures/market/kline"
-    params = {
-        "symbol": symbol,
-        "interval": bitunix_interval,
-        "limit": limit,
-    }
+    params = {"symbol": symbol, "interval": INTERVAL_MAP.get(interval, "60"), "limit": limit}
     resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     body = resp.json()
-
-    # Bitunix response: {"code": 0, "data": [...], "msg": ""}
     if body.get("code") != 0:
         raise ValueError(f"Bitunix API error: {body.get('msg', body)}")
-
-    candles = body["data"]
-    rows = []
-    for c in candles:
-        # Bitunix candle fields: time, open, high, low, close, volume (string values)
-        rows.append({
+    rows = [
+        {
             "open_time": pd.to_datetime(int(c["time"]), unit="ms"),
-            "open":   float(c["open"]),
-            "high":   float(c["high"]),
-            "low":    float(c["low"]),
-            "close":  float(c["close"]),
-            "volume": float(c["volume"]),
-        })
-
-    df = pd.DataFrame(rows).sort_values("open_time").reset_index(drop=True)
-    return df
-
-
-def fetch_ticker(symbol: str) -> dict:
-    """Fetch latest ticker from Bitunix futures (public)."""
-    url = f"{BITUNIX_BASE}/api/v1/futures/market/ticker"
-    resp = requests.get(url, params={"symbol": symbol}, timeout=5)
-    resp.raise_for_status()
-    body = resp.json()
-    if body.get("code") != 0:
-        raise ValueError(f"Bitunix ticker error: {body.get('msg', body)}")
-    return body["data"]
+            "open":  float(c["open"]),
+            "high":  float(c["high"]),
+            "low":   float(c["low"]),
+            "close": float(c["close"]),
+            "volume":float(c["volume"]),
+        }
+        for c in body["data"]
+    ]
+    return pd.DataFrame(rows).sort_values("open_time").reset_index(drop=True)
 
 
-def generate_demo_ohlcv(seed_price: float, limit: int = 200) -> pd.DataFrame:
-    """Generate realistic synthetic OHLCV data for offline testing."""
-    np.random.seed(42)
+def generate_demo_ohlcv(seed_price: float, limit: int = 200, seed: int = 42) -> pd.DataFrame:
+    np.random.seed(seed)
     returns = np.random.normal(0.0002, 0.018, limit)
-    prices = seed_price * np.cumprod(1 + returns)
-
+    prices  = seed_price * np.cumprod(1 + returns)
     rows = []
     for i, close in enumerate(prices):
         spread = close * 0.008
-        high = close + abs(np.random.normal(0, spread))
-        low = close - abs(np.random.normal(0, spread))
-        open_ = prices[i - 1] if i > 0 else close
-        vol = np.random.uniform(100, 5000)
-        ts = pd.Timestamp("2025-01-01") + pd.Timedelta(hours=i)
-        rows.append({"open_time": ts, "open": open_, "high": high,
-                     "low": low, "close": close, "volume": vol})
-
+        rows.append({
+            "open_time": pd.Timestamp("2025-01-01") + pd.Timedelta(hours=i),
+            "open":  prices[i - 1] if i > 0 else close,
+            "high":  close + abs(np.random.normal(0, spread)),
+            "low":   close - abs(np.random.normal(0, spread)),
+            "close": close,
+            "volume":np.random.uniform(100, 5000),
+        })
     return pd.DataFrame(rows)
 
 
@@ -148,231 +119,184 @@ def generate_demo_ohlcv(seed_price: float, limit: int = 200) -> pd.DataFrame:
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+    ag    = gain.ewm(alpha=1 / period, adjust=False).mean()
+    al    = loss.ewm(alpha=1 / period, adjust=False).mean()
+    return 100 - (100 / (1 + ag / al.replace(0, np.nan)))
 
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    ml  = ema(series, fast) - ema(series, slow)
+    sl  = ema(ml, signal)
+    return ml, sl, ml - sl
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    fast_ema = ema(series, fast)
-    slow_ema = ema(series, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = ema(macd_line, signal)
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-
-def bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0):
+def bollinger_bands(series: pd.Series, period=20, std_dev=2.0):
     mid = series.rolling(period).mean()
     std = series.rolling(period).std()
-    upper = mid + std_dev * std
-    lower = mid - std_dev * std
-    return upper, mid, lower
-
+    return mid + std_dev * std, mid, mid - std_dev * std
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     hl = df["high"] - df["low"]
     hc = (df["high"] - df["close"].shift()).abs()
-    lc = (df["low"] - df["close"].shift()).abs()
+    lc = (df["low"]  - df["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
-
-def stochastic_rsi(series: pd.Series, rsi_period: int = 14, stoch_period: int = 14) -> pd.Series:
-    rsi_vals = rsi(series, rsi_period)
-    min_rsi = rsi_vals.rolling(stoch_period).min()
-    max_rsi = rsi_vals.rolling(stoch_period).max()
-    stoch = (rsi_vals - min_rsi) / (max_rsi - min_rsi).replace(0, np.nan) * 100
-    return stoch
+def stochastic_rsi(series: pd.Series, rsi_p=14, stoch_p=14) -> pd.Series:
+    r   = rsi(series, rsi_p)
+    lo  = r.rolling(stoch_p).min()
+    hi  = r.rolling(stoch_p).max()
+    return (r - lo) / (hi - lo).replace(0, np.nan) * 100
 
 
 # ── Signal Engine ─────────────────────────────────────────────────────────────
 
 def compute_indicators(df: pd.DataFrame) -> dict:
     close = df["close"]
-
-    rsi_val = rsi(close).iloc[-1]
-    stoch_rsi_val = stochastic_rsi(close).iloc[-1]
-
-    macd_line, sig_line, histogram = macd(close)
-    macd_hist = histogram.iloc[-1]
-    macd_prev_hist = histogram.iloc[-2]
-
-    bb_upper, bb_mid, bb_lower = bollinger_bands(close)
-    bb_upper_val = bb_upper.iloc[-1]
-    bb_lower_val = bb_lower.iloc[-1]
-    bb_mid_val = bb_mid.iloc[-1]
-    bb_width_pct = (bb_upper_val - bb_lower_val) / bb_mid_val * 100
-
-    ema20  = ema(close, 20).iloc[-1]
-    ema50  = ema(close, 50).iloc[-1]
-    ema200 = ema(close, 200).iloc[-1]
-
-    atr_val = atr(df).iloc[-1]
+    _, _, hist = macd(close)
+    bb_u, bb_m, bb_l = bollinger_bands(close)
     price = close.iloc[-1]
 
     vol_short = df["volume"].iloc[-5:].mean()
     vol_long  = df["volume"].iloc[-20:-5].mean()
-    vol_ratio = vol_short / vol_long if vol_long > 0 else 1.0
-
-    roc_10 = (price - close.iloc[-10]) / close.iloc[-10] * 100
 
     return {
-        "price":         price,
-        "rsi":           rsi_val,
-        "stoch_rsi":     stoch_rsi_val,
-        "macd_hist":     macd_hist,
-        "macd_prev_hist":macd_prev_hist,
-        "bb_upper":      bb_upper_val,
-        "bb_mid":        bb_mid_val,
-        "bb_lower":      bb_lower_val,
-        "bb_width_pct":  bb_width_pct,
-        "ema20":         ema20,
-        "ema50":         ema50,
-        "ema200":        ema200,
-        "atr":           atr_val,
-        "vol_ratio":     vol_ratio,
-        "roc_10":        roc_10,
+        "price":          price,
+        "rsi":            rsi(close).iloc[-1],
+        "stoch_rsi":      stochastic_rsi(close).iloc[-1],
+        "macd_hist":      hist.iloc[-1],
+        "macd_prev_hist": hist.iloc[-2],
+        "bb_upper":       bb_u.iloc[-1],
+        "bb_mid":         bb_m.iloc[-1],
+        "bb_lower":       bb_l.iloc[-1],
+        "bb_width_pct":   (bb_u.iloc[-1] - bb_l.iloc[-1]) / bb_m.iloc[-1] * 100,
+        "ema20":          ema(close, 20).iloc[-1],
+        "ema50":          ema(close, 50).iloc[-1],
+        "ema200":         ema(close, 200).iloc[-1],
+        "atr":            atr(df).iloc[-1],
+        "vol_ratio":      vol_short / vol_long if vol_long > 0 else 1.0,
+        "roc_10":         (price - close.iloc[-10]) / close.iloc[-10] * 100,
     }
 
 
-def generate_signal(ind: dict) -> dict:
-    """
-    Multi-factor scoring: each indicator votes bullish (+) or bearish (-).
-    Score >= 4  → LONG
-    Score <= -4 → SHORT
-    Otherwise   → NEUTRAL
+def score_indicators(ind: dict) -> tuple[int, list[str]]:
+    """Score a single timeframe's indicators. Returns (score, reasons)."""
+    score, reasons, price = 0, [], ind["price"]
 
-    TP/SL are ATR-based with 2:1 R/R minimum.
-    """
-    score = 0
-    reasons = []
-    price = ind["price"]
-
-    # ── RSI ──────────────────────────────────────────────
     if ind["rsi"] < 30:
-        score += 2
-        reasons.append(f"RSI strongly oversold ({ind['rsi']:.1f})")
+        score += 2; reasons.append(f"RSI strongly oversold ({ind['rsi']:.1f})")
     elif ind["rsi"] < 45:
-        score += 1
-        reasons.append(f"RSI bullish zone ({ind['rsi']:.1f})")
+        score += 1; reasons.append(f"RSI bullish zone ({ind['rsi']:.1f})")
     elif ind["rsi"] > 70:
-        score -= 2
-        reasons.append(f"RSI strongly overbought ({ind['rsi']:.1f})")
+        score -= 2; reasons.append(f"RSI strongly overbought ({ind['rsi']:.1f})")
     elif ind["rsi"] > 55:
-        score -= 1
-        reasons.append(f"RSI bearish zone ({ind['rsi']:.1f})")
+        score -= 1; reasons.append(f"RSI bearish zone ({ind['rsi']:.1f})")
     else:
         reasons.append(f"RSI neutral ({ind['rsi']:.1f})")
 
-    # ── Stochastic RSI ───────────────────────────────────
     if not np.isnan(ind["stoch_rsi"]):
         if ind["stoch_rsi"] < 20:
-            score += 1
-            reasons.append(f"Stoch RSI oversold ({ind['stoch_rsi']:.1f})")
+            score += 1; reasons.append(f"Stoch RSI oversold ({ind['stoch_rsi']:.1f})")
         elif ind["stoch_rsi"] > 80:
-            score -= 1
-            reasons.append(f"Stoch RSI overbought ({ind['stoch_rsi']:.1f})")
+            score -= 1; reasons.append(f"Stoch RSI overbought ({ind['stoch_rsi']:.1f})")
 
-    # ── MACD ─────────────────────────────────────────────
     if ind["macd_hist"] > 0 and ind["macd_prev_hist"] <= 0:
-        score += 2
-        reasons.append("MACD bullish crossover ↑")
+        score += 2; reasons.append("MACD bullish crossover ↑")
     elif ind["macd_hist"] < 0 and ind["macd_prev_hist"] >= 0:
-        score -= 2
-        reasons.append("MACD bearish crossover ↓")
+        score -= 2; reasons.append("MACD bearish crossover ↓")
     elif ind["macd_hist"] > 0:
-        score += 1
-        reasons.append(f"MACD histogram positive ({ind['macd_hist']:.4f})")
+        score += 1; reasons.append(f"MACD histogram positive ({ind['macd_hist']:.4f})")
     elif ind["macd_hist"] < 0:
-        score -= 1
-        reasons.append(f"MACD histogram negative ({ind['macd_hist']:.4f})")
+        score -= 1; reasons.append(f"MACD histogram negative ({ind['macd_hist']:.4f})")
 
-    # ── Bollinger Bands ───────────────────────────────────
     if price < ind["bb_lower"]:
-        score += 1
-        reasons.append("Price below lower BB (mean-reversion buy)")
+        score += 1; reasons.append("Price below lower BB (mean-reversion buy)")
     elif price > ind["bb_upper"]:
-        score -= 1
-        reasons.append("Price above upper BB (mean-reversion sell)")
+        score -= 1; reasons.append("Price above upper BB (mean-reversion sell)")
 
-    # ── EMA Trend Alignment ──────────────────────────────
     if ind["ema20"] > ind["ema50"] > ind["ema200"]:
-        score += 2
-        reasons.append("Strong bull trend: EMA 20>50>200")
+        score += 2; reasons.append("Strong bull trend: EMA 20>50>200")
     elif ind["ema20"] < ind["ema50"] < ind["ema200"]:
-        score -= 2
-        reasons.append("Strong bear trend: EMA 20<50<200")
+        score -= 2; reasons.append("Strong bear trend: EMA 20<50<200")
     elif ind["ema20"] > ind["ema50"]:
-        score += 1
-        reasons.append("Short-term uptrend: EMA 20>50")
+        score += 1; reasons.append("Short-term uptrend: EMA 20>50")
     elif ind["ema20"] < ind["ema50"]:
-        score -= 1
-        reasons.append("Short-term downtrend: EMA 20<50")
+        score -= 1; reasons.append("Short-term downtrend: EMA 20<50")
 
-    # ── Macro Trend (price vs EMA200) ────────────────────
     if price > ind["ema200"]:
-        score += 1
-        reasons.append("Above EMA200 — bullish macro")
+        score += 1; reasons.append("Above EMA200 — bullish macro")
     else:
-        score -= 1
-        reasons.append("Below EMA200 — bearish macro")
+        score -= 1; reasons.append("Below EMA200 — bearish macro")
 
-    # ── Volume Confirmation ──────────────────────────────
     if ind["vol_ratio"] > 1.5:
         if score > 0:
-            score += 1
-            reasons.append(f"Volume surge confirms bullish move ({ind['vol_ratio']:.1f}x avg)")
+            score += 1; reasons.append(f"Volume surge confirms bull ({ind['vol_ratio']:.1f}x avg)")
         elif score < 0:
-            score -= 1
-            reasons.append(f"Volume surge confirms bearish move ({ind['vol_ratio']:.1f}x avg)")
+            score -= 1; reasons.append(f"Volume surge confirms bear ({ind['vol_ratio']:.1f}x avg)")
 
-    # ── Momentum (10-period ROC) ─────────────────────────
     if ind["roc_10"] > 3:
-        score += 1
-        reasons.append(f"Strong upward momentum ROC={ind['roc_10']:.2f}%")
+        score += 1; reasons.append(f"Strong upward momentum ROC={ind['roc_10']:.2f}%")
     elif ind["roc_10"] < -3:
-        score -= 1
-        reasons.append(f"Strong downward momentum ROC={ind['roc_10']:.2f}%")
+        score -= 1; reasons.append(f"Strong downward momentum ROC={ind['roc_10']:.2f}%")
 
-    # ── Direction Decision ────────────────────────────────
-    if score >= 4:
-        direction = "LONG"
-    elif score <= -4:
-        direction = "SHORT"
-    else:
-        direction = "NEUTRAL"
+    return score, reasons
 
-    # ── ATR-based TP / SL (2:1 reward:risk) ──────────────
+
+def generate_signal(ind: dict, mtf_bias: str = "NEUTRAL") -> dict:
+    """
+    Score indicators on the primary timeframe, then apply MTF bias bonus.
+
+    MTF bias (from higher timeframes):
+      BULL  → +2 bonus if primary leans long, blocks SHORT signals
+      BEAR  → -2 bonus if primary leans short, blocks LONG signals
+      NEUTRAL → no adjustment
+
+    Thresholds: score >= 4 → LONG, <= -4 → SHORT.
+    TP = entry ± 3×ATR,  SL = entry ± 1.5×ATR  (2:1 R/R)
+    """
+    score, reasons = score_indicators(ind)
+
+    # Apply MTF bias
+    if mtf_bias == "BULL":
+        score += 2
+        reasons.append("MTF bias: higher timeframes BULLISH (+2)")
+    elif mtf_bias == "BEAR":
+        score -= 2
+        reasons.append("MTF bias: higher timeframes BEARISH (-2)")
+
+    # Block counter-trend entries when bias is strong
+    if mtf_bias == "BULL" and score <= -4:
+        score = -3
+        reasons.append("SHORT blocked — higher TF trend is bullish")
+    elif mtf_bias == "BEAR" and score >= 4:
+        score = 3
+        reasons.append("LONG blocked — higher TF trend is bearish")
+
+    direction = "LONG" if score >= 4 else "SHORT" if score <= -4 else "NEUTRAL"
+
     atr_val = ind["atr"]
-    sl_mult = 1.5
-    tp_mult = 3.0
+    price   = ind["price"]
+    sl_mult, tp_mult = 1.5, 3.0
 
     if direction == "LONG":
-        entry  = price
-        sl     = round(entry - sl_mult * atr_val, 2)
-        tp     = round(entry + tp_mult * atr_val, 2)
-        sl_pct = round((entry - sl) / entry * 100, 2)
-        tp_pct = round((tp - entry) / entry * 100, 2)
+        sl     = round(price - sl_mult * atr_val, 2)
+        tp     = round(price + tp_mult * atr_val, 2)
+        sl_pct = round((price - sl) / price * 100, 2)
+        tp_pct = round((tp - price) / price * 100, 2)
     elif direction == "SHORT":
-        entry  = price
-        sl     = round(entry + sl_mult * atr_val, 2)
-        tp     = round(entry - tp_mult * atr_val, 2)
-        sl_pct = round((sl - entry) / entry * 100, 2)
-        tp_pct = round((entry - tp) / entry * 100, 2)
+        sl     = round(price + sl_mult * atr_val, 2)
+        tp     = round(price - tp_mult * atr_val, 2)
+        sl_pct = round((sl - price) / price * 100, 2)
+        tp_pct = round((price - tp) / price * 100, 2)
     else:
-        entry, sl, tp, sl_pct, tp_pct = price, None, None, None, None
+        sl = tp = sl_pct = tp_pct = None
 
     return {
         "direction": direction,
         "score":     score,
-        "entry":     entry,
+        "entry":     price,
         "tp":        tp,
         "sl":        sl,
         "tp_pct":    tp_pct,
@@ -381,96 +305,228 @@ def generate_signal(ind: dict) -> dict:
     }
 
 
+# ── Multi-Timeframe Analysis ──────────────────────────────────────────────────
+
+def mtf_bias(coin: str, demo: bool, demo_seeds: dict) -> tuple[str, dict[str, int]]:
+    """
+    Analyse 4h and 1d timeframes and return an overall bias:
+      BULL  — both higher TFs lean bullish (score > 0)
+      BEAR  — both higher TFs lean bearish (score < 0)
+      NEUTRAL — mixed or flat
+    Also returns per-timeframe scores for display.
+    """
+    symbol  = SYMBOLS[coin]
+    tf_scores: dict[str, int] = {}
+
+    for tf in ["4h", "1d"]:
+        try:
+            if demo:
+                df = generate_demo_ohlcv(demo_seeds[coin], seed=demo_seeds[coin] + hash(tf) % 100)
+            else:
+                df = fetch_ohlcv(symbol, interval=tf)
+            ind = compute_indicators(df)
+            s, _ = score_indicators(ind)
+            tf_scores[tf] = s
+        except Exception:
+            tf_scores[tf] = 0
+
+    bull_count = sum(1 for s in tf_scores.values() if s > 0)
+    bear_count = sum(1 for s in tf_scores.values() if s < 0)
+
+    if bull_count == len(tf_scores):
+        bias = "BULL"
+    elif bear_count == len(tf_scores):
+        bias = "BEAR"
+    else:
+        bias = "NEUTRAL"
+
+    return bias, tf_scores
+
+
+# ── Position Size Calculator ──────────────────────────────────────────────────
+
+def calc_position_size(
+    balance: float,
+    risk_pct: float,
+    entry: float,
+    sl: float,
+    leverage: int = 1,
+) -> dict:
+    """
+    Fixed-percentage risk model:
+      risk_amount  = balance × risk_pct / 100
+      sl_distance  = |entry - sl| / entry  (as a fraction)
+      position_usd = risk_amount / sl_distance
+      contracts    = position_usd / entry
+      notional     = contracts × entry
+      margin_req   = notional / leverage
+    """
+    risk_amount  = balance * risk_pct / 100
+    sl_distance  = abs(entry - sl) / entry
+    if sl_distance == 0:
+        return {}
+    position_usd = risk_amount / sl_distance
+    contracts    = position_usd / entry
+    notional     = contracts * entry
+    margin_req   = notional / leverage
+
+    return {
+        "risk_amount":  round(risk_amount, 2),
+        "position_usd": round(position_usd, 2),
+        "contracts":    round(contracts, 6),
+        "notional":     round(notional, 2),
+        "margin_req":   round(margin_req, 2),
+        "leverage":     leverage,
+    }
+
+
 # ── Display ───────────────────────────────────────────────────────────────────
 
-def direction_color(direction: str) -> str:
-    return {"LONG": Fore.GREEN, "SHORT": Fore.RED, "NEUTRAL": Fore.YELLOW}.get(direction, Fore.WHITE)
+def direction_color(d: str) -> str:
+    return {"LONG": Fore.GREEN, "SHORT": Fore.RED, "NEUTRAL": Fore.YELLOW}.get(d, Fore.WHITE)
 
+def bias_color(b: str) -> str:
+    return {"BULL": Fore.GREEN, "BEAR": Fore.RED, "NEUTRAL": Fore.YELLOW}.get(b, Fore.WHITE)
 
 def strength_bar(score: int) -> str:
     filled = min(abs(score), 10)
-    bar = "█" * filled + "░" * (10 - filled)
-    color = Fore.GREEN if score > 0 else Fore.RED if score < 0 else Fore.YELLOW
+    bar    = "█" * filled + "░" * (10 - filled)
+    color  = Fore.GREEN if score > 0 else Fore.RED if score < 0 else Fore.YELLOW
     return f"{color}[{bar}]{Style.RESET_ALL} {score:+d}"
 
+def score_symbol(score: int) -> str:
+    if score > 0:   return f"{Fore.GREEN}▲ {score:+d}{Style.RESET_ALL}"
+    if score < 0:   return f"{Fore.RED}▼ {score:+d}{Style.RESET_ALL}"
+    return f"{Fore.YELLOW}● {score:+d}{Style.RESET_ALL}"
 
-def print_analysis(coin: str, ind: dict, sig: dict, interval: str):
-    d = direction_color(sig["direction"])
+
+def print_analysis(
+    coin: str,
+    ind: dict,
+    sig: dict,
+    primary_tf: str,
+    bias: str,
+    tf_scores: dict[str, int],
+    pos: dict | None = None,
+):
+    d   = direction_color(sig["direction"])
+    bc  = bias_color(bias)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    print(f"\n╔{'═' * 58}╗")
-    print(f"║  {Fore.CYAN}{Style.BRIGHT}{coin}/USDT PERP{Style.RESET_ALL}  │  ${ind['price']:,.2f}  │  {interval}  │  {now}  ║")
-    print(f"╠{'═' * 58}╣")
-    print(f"║  Signal:  {d}{Style.BRIGHT}{sig['direction']:7s}{Style.RESET_ALL}  {strength_bar(sig['score'])}")
-    print(f"╠{'─' * 58}╣")
+    print(f"\n╔{'═' * 62}╗")
+    print(f"║  {Fore.CYAN}{Style.BRIGHT}{coin}/USDT PERP{Style.RESET_ALL}  │  ${ind['price']:,.2f}  │  {now}")
+    print(f"╠{'═' * 62}╣")
+
+    # MTF summary row
+    tf_line = "  ".join(
+        f"{tf}: {score_symbol(tf_scores.get(tf, 0))}" for tf in ["4h", "1d"]
+    )
+    print(f"║  Higher TF bias: {bc}{Style.BRIGHT}{bias:7s}{Style.RESET_ALL}   ({tf_line})")
+    print(f"║  Primary ({primary_tf}):  {d}{Style.BRIGHT}{sig['direction']:7s}{Style.RESET_ALL}  {strength_bar(sig['score'])}")
+    print(f"╠{'─' * 62}╣")
 
     if sig["direction"] != "NEUTRAL":
-        print(f"║  Entry:   {Style.BRIGHT}${sig['entry']:>12,.2f}{Style.RESET_ALL}")
-        print(f"║  {Fore.GREEN}TP:     ${sig['tp']:>12,.2f}  (+{sig['tp_pct']:.2f}%){Style.RESET_ALL}")
-        print(f"║  {Fore.RED}SL:     ${sig['sl']:>12,.2f}  (-{sig['sl_pct']:.2f}%){Style.RESET_ALL}")
+        print(f"║  Entry : {Style.BRIGHT}${sig['entry']:>12,.2f}{Style.RESET_ALL}")
+        print(f"║  {Fore.GREEN}TP    : ${sig['tp']:>12,.2f}  (+{sig['tp_pct']:.2f}%){Style.RESET_ALL}")
+        print(f"║  {Fore.RED}SL    : ${sig['sl']:>12,.2f}  (-{sig['sl_pct']:.2f}%){Style.RESET_ALL}")
         rr = sig["tp_pct"] / sig["sl_pct"] if sig["sl_pct"] else 0
-        print(f"║  R/R:     1 : {rr:.1f}")
+        print(f"║  R/R   : 1 : {rr:.1f}")
+
+        if pos:
+            print(f"╠{'─' * 62}╣")
+            print(f"║  {Style.BRIGHT}Position Size  (balance=${pos['risk_amount']/( (pos.get('risk_pct') or 1)/100):,.0f}, "
+                  f"risk={pos.get('risk_pct', '?')}%, {pos['leverage']}x leverage):{Style.RESET_ALL}")
+            print(f"║    Risk amount : ${pos['risk_amount']:,.2f}")
+            print(f"║    Position    : ${pos['position_usd']:,.2f}  ({pos['contracts']} contracts)")
+            print(f"║    Notional    : ${pos['notional']:,.2f}")
+            print(f"║    Margin req  : ${pos['margin_req']:,.2f}")
     else:
         print(f"║  No trade — wait for a clearer setup.")
 
-    print(f"╠{'─' * 58}╣")
-    print(f"║  {Style.BRIGHT}Indicators:{Style.RESET_ALL}")
-    print(f"║    RSI(14)       : {ind['rsi']:.1f}")
-    print(f"║    Stoch RSI     : {ind['stoch_rsi']:.1f}")
-    print(f"║    MACD hist     : {ind['macd_hist']:.5f}")
-    print(f"║    BB upper/lower: ${ind['bb_upper']:,.2f} / ${ind['bb_lower']:,.2f}  (width {ind['bb_width_pct']:.1f}%)")
-    print(f"║    EMA 20        : ${ind['ema20']:,.2f}")
-    print(f"║    EMA 50        : ${ind['ema50']:,.2f}")
-    print(f"║    EMA 200       : ${ind['ema200']:,.2f}")
-    print(f"║    ATR(14)       : ${ind['atr']:,.2f}")
-    print(f"║    Volume ratio  : {ind['vol_ratio']:.2f}x  (vs 15-candle avg)")
-    print(f"║    ROC(10)       : {ind['roc_10']:+.2f}%")
+    print(f"╠{'─' * 62}╣")
+    print(f"║  {Style.BRIGHT}Indicators ({primary_tf}):{Style.RESET_ALL}")
+    print(f"║    RSI(14)        : {ind['rsi']:.1f}")
+    print(f"║    Stoch RSI      : {ind['stoch_rsi']:.1f}")
+    print(f"║    MACD hist      : {ind['macd_hist']:.5f}")
+    print(f"║    BB upper/lower : ${ind['bb_upper']:,.2f} / ${ind['bb_lower']:,.2f}  (width {ind['bb_width_pct']:.1f}%)")
+    print(f"║    EMA 20/50/200  : ${ind['ema20']:,.2f} / ${ind['ema50']:,.2f} / ${ind['ema200']:,.2f}")
+    print(f"║    ATR(14)        : ${ind['atr']:,.2f}")
+    print(f"║    Volume ratio   : {ind['vol_ratio']:.2f}x  (vs 15-candle avg)")
+    print(f"║    ROC(10)        : {ind['roc_10']:+.2f}%")
 
-    print(f"╠{'─' * 58}╣")
+    print(f"╠{'─' * 62}╣")
     print(f"║  {Style.BRIGHT}Signal reasons:{Style.RESET_ALL}")
     for r in sig["reasons"]:
         print(f"║    • {r}")
-    print(f"╚{'═' * 58}╝\n")
+    print(f"╚{'═' * 62}╝\n")
 
 
-def print_alert(coin: str, sig: dict, prev_direction: str):
-    d = direction_color(sig["direction"])
-    print(f"\n{'▶' * 3} {Fore.YELLOW}{Style.BRIGHT}SIGNAL CHANGE ALERT{Style.RESET_ALL} {'◀' * 3}")
-    print(f"  {Fore.CYAN}{coin}/USDT PERP{Style.RESET_ALL}  {prev_direction} → {d}{Style.BRIGHT}{sig['direction']}{Style.RESET_ALL}")
+def print_alert(coin: str, sig: dict, prev: str, bias: str):
+    d  = direction_color(sig["direction"])
+    bc = bias_color(bias)
+    print(f"\n{'▶' * 3} {Fore.YELLOW}{Style.BRIGHT}SIGNAL ALERT{Style.RESET_ALL} {'◀' * 3}")
+    print(f"  {Fore.CYAN}{coin}/USDT PERP{Style.RESET_ALL}  {prev} → {d}{Style.BRIGHT}{sig['direction']}{Style.RESET_ALL}  │  MTF: {bc}{bias}{Style.RESET_ALL}")
     print(f"  Entry: ${sig['entry']:,.2f}")
     if sig["tp"]:
-        print(f"  {Fore.GREEN}TP: ${sig['tp']:,.2f}  (+{sig['tp_pct']:.2f}%){Style.RESET_ALL}")
-        print(f"  {Fore.RED}SL: ${sig['sl']:,.2f}  (-{sig['sl_pct']:.2f}%){Style.RESET_ALL}")
-    print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  {Fore.GREEN}TP: ${sig['tp']:,.2f}  (+{sig['tp_pct']:.2f}%){Style.RESET_ALL}   "
+              f"{Fore.RED}SL: ${sig['sl']:,.2f}  (-{sig['sl_pct']:.2f}%){Style.RESET_ALL}")
+    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'▶' * 40}\n")
 
 
 # ── Analysis Runner ───────────────────────────────────────────────────────────
 
-def analyze(coins: list, interval: str, verbose: bool, demo: bool = False) -> dict:
-    demo_prices = {"BTC": 107000.0, "ETH": 2520.0}
+DEMO_SEEDS = {"BTC": 107000, "ETH": 2520}
+
+
+def analyze(
+    coins: list,
+    interval: str,
+    balance: float | None,
+    risk_pct: float,
+    leverage: int,
+    verbose: bool,
+    demo: bool,
+    use_mtf: bool = True,
+) -> dict:
     results = {}
 
     for coin in coins:
         symbol = SYMBOLS[coin]
         try:
+            # Primary timeframe data
             if demo:
-                df = generate_demo_ohlcv(demo_prices[coin])
-                print(f"{Fore.YELLOW}[DEMO]{Style.RESET_ALL} Using synthetic data for {coin}")
+                df = generate_demo_ohlcv(DEMO_SEEDS[coin])
+                if verbose:
+                    print(f"{Fore.YELLOW}[DEMO]{Style.RESET_ALL} Synthetic data for {coin}")
             else:
                 df = fetch_ohlcv(symbol, interval=interval)
 
             ind = compute_indicators(df)
-            sig = generate_signal(ind)
-            results[coin] = (ind, sig)
+
+            # Multi-timeframe bias (skip if primary is already the highest TF)
+            if use_mtf and interval not in ("4h", "1d"):
+                bias, tf_scores = mtf_bias(coin, demo, DEMO_SEEDS)
+            else:
+                bias, tf_scores = "NEUTRAL", {}
+
+            sig = generate_signal(ind, mtf_bias=bias)
+
+            # Position sizing
+            pos = None
+            if balance and sig["sl"] is not None:
+                pos = calc_position_size(balance, risk_pct, sig["entry"], sig["sl"], leverage)
+                pos["risk_pct"] = risk_pct
+
+            results[coin] = (ind, sig, bias, tf_scores, pos)
 
             if verbose:
-                print_analysis(coin, ind, sig, interval)
+                print_analysis(coin, ind, sig, interval, bias, tf_scores, pos)
 
         except requests.HTTPError as e:
             print(f"{Fore.RED}HTTP error fetching {coin}: {e}{Style.RESET_ALL}")
         except requests.ConnectionError:
-            print(f"{Fore.RED}Network error: cannot reach Bitunix. Check connection or use --demo.{Style.RESET_ALL}")
+            print(f"{Fore.RED}Cannot reach Bitunix. Check connection or use --demo.{Style.RESET_ALL}")
         except ValueError as e:
             print(f"{Fore.RED}{e}{Style.RESET_ALL}")
         except Exception as e:
@@ -479,18 +535,26 @@ def analyze(coins: list, interval: str, verbose: bool, demo: bool = False) -> di
     return results
 
 
-def monitor_loop(coins: list, interval: str, refresh: int, demo: bool):
-    print(f"{Fore.CYAN}Monitoring {', '.join(coins)} every {refresh}s on {interval} candles (Bitunix Futures).{Style.RESET_ALL}")
-    print("Press Ctrl+C to stop.\n")
-    prev_signals: dict[str, str] = {}
+def monitor_loop(
+    coins: list,
+    interval: str,
+    refresh: int,
+    balance: float | None,
+    risk_pct: float,
+    leverage: int,
+    demo: bool,
+):
+    print(f"{Fore.CYAN}Monitoring {', '.join(coins)} on {interval} with MTF confirmation.{Style.RESET_ALL}")
+    print(f"Refresh every {refresh}s. Press Ctrl+C to stop.\n")
+    prev: dict[str, str] = {}
 
     while True:
-        results = analyze(coins, interval, verbose=True, demo=demo)
-        for coin, (ind, sig) in results.items():
-            prev = prev_signals.get(coin, "NEUTRAL")
-            if sig["direction"] != "NEUTRAL" and sig["direction"] != prev:
-                print_alert(coin, sig, prev)
-            prev_signals[coin] = sig["direction"]
+        results = analyze(coins, interval, balance, risk_pct, leverage, verbose=True, demo=demo)
+        for coin, (ind, sig, bias, tf_scores, pos) in results.items():
+            p = prev.get(coin, "NEUTRAL")
+            if sig["direction"] != "NEUTRAL" and sig["direction"] != p:
+                print_alert(coin, sig, p, bias)
+            prev[coin] = sig["direction"]
 
         print(f"{Fore.WHITE}Next refresh in {refresh}s  [{datetime.now().strftime('%H:%M:%S')}]{Style.RESET_ALL}")
         try:
@@ -503,54 +567,42 @@ def monitor_loop(coins: list, interval: str, refresh: int, demo: bool):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    api_key    = os.getenv("BITUNIX_API_KEY", "")
-    api_secret = os.getenv("BITUNIX_API_SECRET", "")
-
     parser = argparse.ArgumentParser(
-        description="BTC/ETH Bitunix Futures signal analyzer — LONG/SHORT with TP and SL",
+        description="BTC/ETH Bitunix Futures — LONG/SHORT signals with MTF + position sizing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python crypto_analyzer.py                          # BTC + ETH, 1h, one-shot
-  python crypto_analyzer.py --coins BTC --interval 4h
-  python crypto_analyzer.py --monitor --refresh 300  # alert on signal changes
-  python crypto_analyzer.py --demo                   # offline synthetic data
-
-API credentials (for future order-placement features):
-  export BITUNIX_API_KEY=your_key
-  export BITUNIX_API_SECRET=your_secret
+  python crypto_analyzer.py                               # BTC+ETH, MTF, no sizing
+  python crypto_analyzer.py --balance 10000 --risk 1     # 1% risk on $10k account
+  python crypto_analyzer.py --balance 5000 --risk 2 --leverage 5
+  python crypto_analyzer.py --coins BTC --interval 4h    # single TF, no MTF
+  python crypto_analyzer.py --monitor --refresh 300      # continuous mode
+  python crypto_analyzer.py --demo                       # offline test
         """
     )
-    parser.add_argument(
-        "--coins", nargs="+", choices=["BTC", "ETH"], default=["BTC", "ETH"],
-        metavar="COIN", help="Coins to analyze: BTC ETH (default: both)"
-    )
-    parser.add_argument(
-        "--interval", default="1h",
-        choices=list(INTERVAL_MAP.keys()),
-        help="Candle interval (default: 1h)"
-    )
-    parser.add_argument(
-        "--monitor", action="store_true",
-        help="Continuously monitor and alert on signal changes"
-    )
-    parser.add_argument(
-        "--refresh", type=int, default=300,
-        help="Seconds between refreshes in monitor mode (default: 300)"
-    )
-    parser.add_argument(
-        "--demo", action="store_true",
-        help="Use synthetic offline data (no internet required)"
-    )
+    parser.add_argument("--coins",    nargs="+", choices=["BTC", "ETH"], default=["BTC", "ETH"])
+    parser.add_argument("--interval", default="1h", choices=list(INTERVAL_MAP.keys()))
+    parser.add_argument("--balance",  type=float, default=None,
+                        help="Account balance in USDT for position sizing")
+    parser.add_argument("--risk",     type=float, default=1.0,
+                        help="Risk per trade as %% of balance (default: 1.0)")
+    parser.add_argument("--leverage", type=int,   default=1,
+                        help="Futures leverage for margin calculation (default: 1)")
+    parser.add_argument("--monitor",  action="store_true")
+    parser.add_argument("--refresh",  type=int,   default=300)
+    parser.add_argument("--demo",     action="store_true")
     args = parser.parse_args()
 
+    api_key = os.getenv("BITUNIX_API_KEY", "")
     if api_key:
-        print(f"{Fore.GREEN}API key loaded.{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}Bitunix API key loaded.{Style.RESET_ALL}")
 
     if args.monitor:
-        monitor_loop(args.coins, args.interval, args.refresh, args.demo)
+        monitor_loop(args.coins, args.interval, args.refresh,
+                     args.balance, args.risk, args.leverage, args.demo)
     else:
-        analyze(args.coins, args.interval, verbose=True, demo=args.demo)
+        analyze(args.coins, args.interval, args.balance, args.risk,
+                args.leverage, verbose=True, demo=args.demo)
 
 
 if __name__ == "__main__":
