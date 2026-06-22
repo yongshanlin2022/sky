@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=BTC/ETH Analyzer
+Comment=Bitunix Futures signal analyzer with LONG/SHORT alerts
+Exec=bash -c "cd %k/.. && bash launch.sh; exec bash"
+Icon=utilities-terminal
+Terminal=true
+Categories=Finance;
